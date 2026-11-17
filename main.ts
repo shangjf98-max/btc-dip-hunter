@@ -6,17 +6,23 @@
 // Its whole playbook is one idea: buy a sharp pullback, then sit on it.
 //
 //   - Dip entry: once 60 bars of history exist, if the latest close is at least
-//     120 bps below the highest high of the last 61 bars (the 60 before it plus
-//     its own), spend all cash on one full-size buy. At most two entries per
-//     window, with a 30-bar cooldown after any exit.
+//     110 bps below the highest high of the last 61 bars (the 60 before it plus
+//     its own), spend all cash on one full-size buy. A second entry, after a
+//     winning exit, needs a deeper dip of 200 bps: buying the bounce after an
+//     exit is how give-back turns into a loss. At most two entries per window,
+//     with a 30-bar cooldown after any exit.
 //   - Participation fallback: if no dip ever fires, buy on the first 60-bar
 //     breakout at or after bar 720 (a steadily rising day has no dips to buy),
 //     and buy unconditionally at bar 1200 so the window never ends flat.
-//   - Exits: a 250 bps trailing stop off the highest close since entry locks in
-//     a spike without chopping through normal pullbacks, and a 400 bps stop
-//     off cost basis caps a disaster. After an exit that loses money the bot
-//     stops trading: the day's regime is hostile and a second dip is likely
-//     another falling knife.
+//   - Exits: a trailing stop of 75 bps off the highest HIGH since entry, but
+//     armed only once the peak sits 40 bps above cost basis, so the trail
+//     locks in real spikes instead of chopping a position that never got
+//     going; a 400 bps stop off cost basis caps a disaster. Tracking highs
+//     rather than closes lets the trail react to a spike's top within the
+//     bar that prints it, instead of waiting for a weak close to confirm
+//     the give-back. After an exit that loses money the bot stops trading:
+//     the day's regime is hostile and a second dip is likely another
+//     falling knife.
 //   - No entries after bar 1410: a fill there leaves no time to earn its cost
 //     before the end-of-window flatten.
 //
@@ -30,9 +36,13 @@ import { BPS, runBars, type BarsState, type OrderInput } from './vendor/makefun-
 /** Bars of history behind the dip and breakout signals. */
 const LOOKBACK_BARS = 60;
 /** A close this far below the recent high counts as a dip worth buying. */
-const DIP_BPS = 120n;
-/** Give-back allowed from the highest close since entry before selling. */
-const TRAIL_BPS = 250n;
+const DIP_BPS = 110n;
+/** The deeper dip a second entry (after a winning exit) must wait for. */
+const DIP2_BPS = 200n;
+/** Give-back allowed from the highest high since entry before selling. */
+const TRAIL_BPS = 75n;
+/** The trail arms only once the peak is this far above cost basis. */
+const ARM_BPS = 40n;
 /** Loss from cost basis that forces an exit, whatever the trail says. */
 const STOP_BPS = 400n;
 /** Bars to wait after an exit before the next entry may fire. */
@@ -63,10 +73,10 @@ let blocked = false;
 let coolUntil = -1;
 /** Batch seq until which a sent buy is awaited before it may be re-decided. */
 let pendingBuyUntil = -1;
-/** Highest close since the current position opened (null while flat). */
+/** Highest high since the current position opened (null while flat). */
 let peak: bigint | null = null;
-/** The close on the bar the current position's buy was decided on. */
-let entrySignalClose = 0n;
+/** The high on the bar the current position's buy was decided on. */
+let entrySignalHigh = 0n;
 /** Whether a position was held on the previous batch (for entry detection). */
 let wasHolding = false;
 
@@ -88,12 +98,12 @@ await runBars({
     const holding = held !== undefined;
 
     // A fill observed: count the entry, and seed the trailing peak with the
-    // close the buy was decided on (the dip bar) as well as today's close.
+    // high of the bar the buy was decided on (the dip bar's high); the
+    // holding branch below folds in each new bar's high from here on.
     if (holding && !wasHolding) {
       entries += 1;
       pendingBuyUntil = -1;
-      const close = state.close(symbol);
-      peak = close === null ? entrySignalClose : close > entrySignalClose ? close : entrySignalClose;
+      peak = entrySignalHigh;
     }
     if (!holding) peak = null;
     wasHolding = holding;
@@ -106,14 +116,24 @@ await runBars({
     const idx = barsSeen;
 
     if (!state.warmingUp && holding && held !== undefined) {
-      // Trail first: the peak includes this close, so a fresh high never exits.
-      if (peak !== null && close > peak) peak = close;
+      // Peak tracks highs: fold this bar's high in first, so a fresh spike
+      // top raises the trail before the close is judged against it.
+      if (peak !== null && high > peak) peak = high;
       const value = state.value(symbol, held.qty, close);
       const stopped = value * BPS < held.cost * (BPS - STOP_BPS);
-      const trailed = peak !== null && close * BPS < peak * (BPS - TRAIL_BPS);
+      // The trail arms only once the peak value clears cost basis by ARM_BPS:
+      // an unarmed trail would sell a dip that merely wobbled sideways.
+      const peakValue = peak === null ? 0n : state.value(symbol, held.qty, peak);
+      const armed = peakValue * BPS >= held.cost * (BPS + ARM_BPS);
+      const trailed = armed && peak !== null && close * BPS < peak * (BPS - TRAIL_BPS);
       if (stopped || trailed) {
         if (value < held.cost) blocked = true;
         coolUntil = idx + COOLDOWN_BARS;
+        // Record this bar before leaving: the exit bar is history too, and
+        // every later cutoff and lookback counts recorded bars.
+        closes.push(close);
+        highs.push(high);
+        barsSeen += 1;
         return [{ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
     }
@@ -123,12 +143,14 @@ await runBars({
       if (!awaitingFill && idx >= coolUntil) {
         let buy = false;
         if (idx >= LOOKBACK_BARS) {
-          // Dip: this close 120+ bps under the highest high of the last 61 bars.
+          // Dip: this close DIP_BPS (first entry) or DIP2_BPS (second entry)
+          // under the highest high of the last 61 bars.
+          const dipBps = entries === 0 ? DIP_BPS : DIP2_BPS;
           let windowHigh = high;
           for (let i = Math.max(0, highs.length - LOOKBACK_BARS); i < highs.length; i++) {
             if (highs[i]! > windowHigh) windowHigh = highs[i]!;
           }
-          if (close * BPS < windowHigh * (BPS - DIP_BPS)) buy = true;
+          if (close * BPS < windowHigh * (BPS - dipBps)) buy = true;
         }
         if (!buy && entries === 0) {
           // Fallbacks, only while nothing has traded yet.
@@ -145,7 +167,7 @@ await runBars({
         if (buy) {
           const orders = buyAll(state);
           if (orders.length > 0) {
-            entrySignalClose = close;
+            entrySignalHigh = high;
             pendingBuyUntil = state.seq + 2;
             closes.push(close);
             highs.push(high);

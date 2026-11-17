@@ -69,6 +69,8 @@ const highs: bigint[] = [];
 let entries = 0;
 /** Set once an exit loses money: no further entries for the rest of the window. */
 let blocked = false;
+/** Whether the exit most recently decided on would lose money at this close. */
+let exitWasLosing = false;
 /** Recorded-bar index before which no entry may fire (cooldown after an exit). */
 let coolUntil = -1;
 /** Batch seq until which a sent buy is awaited before it may be re-decided. */
@@ -95,7 +97,9 @@ await runBars({
   onBatch(state, batch) {
     const bar = batch.bars.find((b) => b.symbol === symbol);
     const held = state.positions.get(symbol);
-    const holding = held !== undefined;
+    // A zero-quantity position (never sent by the real engine, but cheap to
+    // guard) counts as flat: selling it would be a zero-amount order.
+    const holding = held !== undefined && held.qty > 0n;
 
     // A fill observed: count the entry, and seed the trailing peak with the
     // high of the bar the buy was decided on (the dip bar's high); the
@@ -105,6 +109,11 @@ await runBars({
       pendingBuyUntil = -1;
       peak = entrySignalHigh;
     }
+    // A position gone means the decided exit actually filled: only now does
+    // a losing exit block further entries. (A rejected sell leaves the
+    // position held, so a decision-time block would wrongly ban re-entry
+    // after the price recovered and a later exit won.)
+    if (!holding && wasHolding && exitWasLosing) blocked = true;
     if (!holding) peak = null;
     wasHolding = holding;
 
@@ -127,7 +136,7 @@ await runBars({
       const armed = peakValue * BPS >= held.cost * (BPS + ARM_BPS);
       const trailed = armed && peak !== null && close * BPS < peak * (BPS - TRAIL_BPS);
       if (stopped || trailed) {
-        if (value < held.cost) blocked = true;
+        exitWasLosing = value < held.cost;
         coolUntil = idx + COOLDOWN_BARS;
         // Record this bar before leaving: the exit bar is history too, and
         // every later cutoff and lookback counts recorded bars.
